@@ -329,7 +329,7 @@ async function syncGongCalls(){
   const matchedCalls = [];
 
   try {
-    addSyncLog('Fetching recent Gong calls (last 30 days)...');
+    addSyncLog('Fetching recent Gong calls (last 60 days)...');
     let cursor = null, page = 0, total = 0;
 
     do {
@@ -350,25 +350,7 @@ async function syncGongCalls(){
       page++;
       let hit = 0;
 
-      // Debug: on page 1, show exactly what Gong returns so we can see field names
-      if(page === 1 && calls.length > 0){
-        const sample = calls[0];
-        const ext = (sample.parties||[]).find(p=>p.affiliation==='External');
-        const intP = (sample.parties||[]).find(p=>p.affiliation==='Internal');
-        addSyncLog('DEBUG - Call title: ' + (sample.title||'(none)'));
-        addSyncLog('DEBUG - External: ' + (ext ? (ext.name||ext.emailAddress||'(none)') : '(none)'));
-        addSyncLog('DEBUG - Internal rep: ' + (intP ? (intP.name||'(none)') : '(none)'));
-        // Show CRM context data
-        const ctxObjs = [];
-        (sample.context||[]).forEach(ctx => {
-          (ctx.objects||[]).forEach(obj => {
-            const fields = (obj.fields||[]).map(f=>f.name+'='+f.value).join(', ');
-            ctxObjs.push(obj.objectType+': '+fields);
-          });
-        });
-        addSyncLog('DEBUG - CRM context: ' + (ctxObjs.length ? ctxObjs.slice(0,3).join(' | ') : '(none - context may need enabling)'));
-        addSyncLog('DEBUG - Your CSV names (first 3): ' + accountNames.slice(0,3).join(', '));
-      }
+
 
       for(const c of calls){
         if(existingIds.has(c.id)) continue;
@@ -379,8 +361,7 @@ async function syncGongCalls(){
       setState({ syncProgress:{current:total,total:total,status:'Scanned '+total+' calls, '+matchedCalls.length+' matched...'} });
       cursor = data.records && data.records.cursor ? data.records.cursor : null;
       if(calls.length === 0) break;
-      // Only scan first 3 pages in debug mode to see results fast
-      if(page >= 3) { addSyncLog('DEBUG: Stopping after 3 pages. Check field names above then we will fix matching.'); break; }
+
       await new Promise(r=>setTimeout(r,150));
     } while(cursor);
 
