@@ -282,13 +282,37 @@ async function syncGongCalls(){
 
   function matchAccount(call){
     const title = (call.title||'').toLowerCase();
+    
+    // Check Salesforce CRM context - this is where Gong stores the account name
+    const crmNames = [];
+    (call.context||[]).forEach(ctx => {
+      (ctx.objects||[]).forEach(obj => {
+        // Salesforce Account object
+        if(obj.objectType === 'Account' || obj.objectType === 'account'){
+          (obj.fields||[]).forEach(f => {
+            if(f.name === 'Name' || f.name === 'name' || f.name === 'AccountName'){
+              if(f.value) crmNames.push(f.value.toLowerCase());
+            }
+          });
+        }
+        // Also grab any name field from any CRM object
+        (obj.fields||[]).forEach(f => {
+          if((f.name === 'Name' || f.name === 'name') && f.value){
+            crmNames.push(f.value.toLowerCase());
+          }
+        });
+      });
+    });
+
     const parties = (call.parties||[]).map(p=>[
-      p.name||'', 
-      p.emailAddress||'', 
+      p.name||'',
+      p.emailAddress||'',
       p.organizationName||'',
       p.company||''
     ].join(' ')).join(' ').toLowerCase();
-    const haystack = title + ' ' + parties;
+
+    const haystack = title + ' ' + parties + ' ' + crmNames.join(' ');
+
     for(const name of accountNames){
       if(name.length >= 3 && haystack.includes(name)) return accountMap[name];
     }
@@ -313,7 +337,10 @@ async function syncGongCalls(){
         filter:{ fromDateTime:fromISO, toDateTime:toISO },
         contentSelector:{
           context: 'Extended',
-          exposedFields: { parties: true, content: { structure: true } }
+          exposedFields: {
+            parties: true,
+            context: true
+          }
         }
       };
       if(cursor) body.cursor = cursor;
@@ -328,11 +355,18 @@ async function syncGongCalls(){
         const sample = calls[0];
         const ext = (sample.parties||[]).find(p=>p.affiliation==='External');
         const intP = (sample.parties||[]).find(p=>p.affiliation==='Internal');
-        addSyncLog('DEBUG - Sample call title: ' + (sample.title||'(none)'));
-        addSyncLog('DEBUG - External party name: ' + (ext ? (ext.name||ext.emailAddress||'(no name)') : '(none)'));
-        addSyncLog('DEBUG - External org/company: ' + (ext ? (ext.organizationName||ext.company||'(no org field)') : '(none)'));
-        addSyncLog('DEBUG - Internal rep name: ' + (intP ? (intP.name||'(none)') : '(none)'));
-        addSyncLog('DEBUG - All party names: ' + (sample.parties||[]).map(p=>p.name||p.emailAddress||'?').join(', '));
+        addSyncLog('DEBUG - Call title: ' + (sample.title||'(none)'));
+        addSyncLog('DEBUG - External: ' + (ext ? (ext.name||ext.emailAddress||'(none)') : '(none)'));
+        addSyncLog('DEBUG - Internal rep: ' + (intP ? (intP.name||'(none)') : '(none)'));
+        // Show CRM context data
+        const ctxObjs = [];
+        (sample.context||[]).forEach(ctx => {
+          (ctx.objects||[]).forEach(obj => {
+            const fields = (obj.fields||[]).map(f=>f.name+'='+f.value).join(', ');
+            ctxObjs.push(obj.objectType+': '+fields);
+          });
+        });
+        addSyncLog('DEBUG - CRM context: ' + (ctxObjs.length ? ctxObjs.slice(0,3).join(' | ') : '(none - context may need enabling)'));
         addSyncLog('DEBUG - Your CSV names (first 3): ' + accountNames.slice(0,3).join(', '));
       }
 
