@@ -268,12 +268,30 @@ async function syncGongCalls(){
   const { gongKey, gongSecret, anthropicKey, accountList } = STATE;
   if(!gongKey||!gongSecret) { alert('Please add your Gong credentials in Settings first.'); return; }
   if(!anthropicKey) { alert('Please add your Anthropic API key in Settings first.'); return; }
-  if(!accountList.length) { alert('Please upload your account list CSV first so we know which calls to pull.'); return; }
+  if(!accountList.length) { alert('Please upload your account list CSV first.'); return; }
 
-  setState({ syncing:true, syncProgress:{current:0,total:accountList.length,status:'Starting account-by-account search...'}, syncLog:[] });
+  setState({ syncing:true, syncProgress:{current:0,total:0,status:'Connecting...'}, syncLog:[] });
 
-  // Date range: last 90 days
-  const from = new Date(); from.setDate(from.getDate()-90);
+  // Build fast lookup map
+  const accountMap = {};
+  accountList.forEach(a => {
+    const key = (a.accountName||'').toLowerCase().trim();
+    if(key.length >= 3) accountMap[key] = a;
+  });
+  const accountNames = Object.keys(accountMap);
+
+  function matchAccount(call){
+    const title = (call.title||'').toLowerCase();
+    const parties = (call.parties||[]).map(p=>(p.name||p.emailAddress||'')).join(' ').toLowerCase();
+    const haystack = title + ' ' + parties;
+    for(const name of accountNames){
+      if(haystack.includes(name)) return accountMap[name];
+    }
+    return null;
+  }
+
+  // 30 day window — fast, covers active pipeline
+  const from = new Date(); from.setDate(from.getDate()-30);
   const fromISO = from.toISOString();
   const toISO = new Date().toISOString();
 
@@ -282,138 +300,97 @@ async function syncGongCalls(){
   const matchedCalls = [];
 
   try {
-    // Step 1: Search Gong account by account — never pulls the full library
-    addSyncLog(`Searching Gong for ${accountList.length} accounts (last 90 days)...`);
+    addSyncLog('Fetching recent Gong calls (last 30 days)...');
+    let cursor = null, page = 0, total = 0;
 
-    for(let i=0; i<accountList.length; i++){
-      const account = accountList[i];
-      const name = account.accountName?.trim();
-      if(!name) continue;
-
-      setState({ syncProgress:{current:i+1, total:accountList.length, status:`Searching: ${name}`} });
-
-      try {
-        // Use Gong's search endpoint to find calls by company name
-        const data = await gongRequest('/v2/calls/extensive', {
-          filter:{
-            fromDateTime: fromISO,
-            toDateTime: toISO,
-            companyName: name,
-          }
-        }, gongKey, gongSecret);
-
-        const calls = data.calls || [];
-        if(calls.length){
-          addSyncLog(`Found ${calls.length} call${calls.length>1?'s':''} for ${name}`);
-          calls.forEach(c => { c._accountMeta = account; });
-          matchedCalls.push(...calls.filter(c=>!existingIds.has(c.id)));
-        }
-      } catch(e){
-        // If companyName filter isn't supported, fall back to title search
-        try {
-          const data = await gongRequest('/v2/calls/extensive', {
-            filter:{
-              fromDateTime: fromISO,
-              toDateTime: toISO,
-            },
-            contentSelector:{ context:'Extended', exposedFields:{ parties:true } }
-          }, gongKey, gongSecret);
-          const calls = (data.calls||[]).filter(c=>{
-            const title=(c.title||'').toLowerCase();
-            const parties=(c.parties||[]).map(p=>p.name||'').join(' ').toLowerCase();
-            const n=name.toLowerCase();
-            return title.includes(n)||parties.includes(n);
-          });
-          if(calls.length){
-            addSyncLog(`Found ${calls.length} call${calls.length>1?'s':''} for ${name} (title match)`);
-            calls.forEach(c=>{ c._accountMeta=account; });
-            matchedCalls.push(...calls.filter(c=>!existingIds.has(c.id)));
-          }
-        } catch(e2){ addSyncLog(`Skip ${name}: ${e2.message}`); }
+    do {
+      const body = { filter:{ fromDateTime:fromISO, toDateTime:toISO } };
+      if(cursor) body.cursor = cursor;
+      const data = await gongRequest('/v2/calls/extensive', body, gongKey, gongSecret);
+      const calls = data.calls || [];
+      total += calls.length;
+      page++;
+      let hit = 0;
+      for(const c of calls){
+        if(existingIds.has(c.id)) continue;
+        const acct = matchAccount(c);
+        if(acct){ c._accountMeta = acct; matchedCalls.push(c); hit++; }
       }
+      addSyncLog('Page '+page+': '+calls.length+' calls, '+hit+' matched (total matched: '+matchedCalls.length+')');
+      setState({ syncProgress:{current:total,total:total,status:'Scanned '+total+' calls, '+matchedCalls.length+' matched...'} });
+      cursor = data.records && data.records.cursor ? data.records.cursor : null;
+      if(calls.length === 0) break;
+      await new Promise(r=>setTimeout(r,150));
+    } while(cursor);
 
-      // Small delay to avoid rate limiting
-      await new Promise(r=>setTimeout(r,300));
-    }
-
-    addSyncLog(`Total new matched calls: ${matchedCalls.length}`);
+    addSyncLog('Scan done. '+total+' total, '+matchedCalls.length+' matched your account list.');
 
     if(!matchedCalls.length){
-      addSyncLog('No new calls found. All may already be analyzed, or company names may not match Gong records.');
+      addSyncLog('No matches found. Make sure company names in your CSV match how they appear in Gong call titles or participant names.');
       setState({ syncing:false });
       return;
     }
 
-    // Step 2: Pull transcripts in batches of 10
-    setState({ syncProgress:{current:0,total:matchedCalls.length,status:`Fetching transcripts for ${matchedCalls.length} calls...`} });
-    addSyncLog(`Fetching transcripts for ${matchedCalls.length} calls...`);
-
+    // Pull transcripts in batches of 10
+    setState({ syncProgress:{current:0,total:matchedCalls.length,status:'Fetching transcripts...'} });
+    addSyncLog('Fetching transcripts for '+matchedCalls.length+' calls...');
     const BATCH = 10;
     for(let i=0;i<matchedCalls.length;i+=BATCH){
       const batch = matchedCalls.slice(i,i+BATCH);
       const ids = batch.map(c=>c.id);
-      let transcriptData;
-      try {
-        transcriptData = await gongRequest('/v2/calls/transcript', { filter:{ callIds:ids } }, gongKey, gongSecret);
-      } catch(e){ addSyncLog(`Transcript fetch error: ${e.message}`); continue; }
+      let txData;
+      try { txData = await gongRequest('/v2/calls/transcript',{filter:{callIds:ids}},gongKey,gongSecret); }
+      catch(e){ addSyncLog('Transcript error: '+e.message); continue; }
 
       const txMap = {};
-      (transcriptData.callTranscripts||[]).forEach(t => {
-        const text = (t.transcript||[]).map(u => u.sentences?.map(s=>s.text).join(' ')||'').join('\n');
-        txMap[t.callId] = text;
+      (txData.callTranscripts||[]).forEach(t=>{
+        txMap[t.callId] = (t.transcript||[]).map(u=>(u.sentences||[]).map(s=>s.text).join(' ')).join('
+');
       });
 
       for(const call of batch){
         const transcript = txMap[call.id];
-        if(!transcript||transcript.trim().length < 100){ addSyncLog(`Skip (no transcript): ${call.title||call.id}`); continue; }
-
+        if(!transcript||transcript.trim().length<100){ addSyncLog('Skip (no transcript): '+(call.title||call.id)); continue; }
         const accountMeta = call._accountMeta;
         const ext = (call.parties||[]).find(p=>p.affiliation==='External');
-        const companyName = accountMeta?.accountName || ext?.name || call.title || '';
+        const companyName = accountMeta ? accountMeta.accountName : (ext ? ext.name : (call.title||''));
         const repParty = (call.parties||[]).find(p=>p.affiliation==='Internal');
-        const repName = accountMeta?.rep || repParty?.name || '';
-
-        setState({ syncProgress:{current:i+1,total:matchedCalls.length,status:`Analyzing: ${companyName}`} });
-
+        const repName = (accountMeta&&accountMeta.rep) ? accountMeta.rep : (repParty ? repParty.name : '');
+        setState({ syncProgress:{current:i+1,total:matchedCalls.length,status:'Analyzing: '+companyName} });
         try {
-          const analyzed = await analyzeWithClaude(transcript, {
-            rep: repName,
-            company: companyName,
-            acv: accountMeta?.acv,
-            industry: accountMeta?.industry,
-            employees: accountMeta?.employees,
-            leadSource: accountMeta?.leadSource,
-            stage: accountMeta?.stage,
-            stageTag: accountMeta?.stageTag,
+          const analyzed = await analyzeWithClaude(transcript,{
+            rep:repName, company:companyName,
+            acv:accountMeta?accountMeta.acv:null,
+            industry:accountMeta?accountMeta.industry:null,
+            employees:accountMeta?accountMeta.employees:null,
+            leadSource:accountMeta?accountMeta.leadSource:null,
+            stage:accountMeta?accountMeta.stage:null,
           }, anthropicKey);
-
           const callObj = {
-            id: call.id,
-            date: call.started?.split('T')[0] || new Date().toISOString().split('T')[0],
-            duration: Math.round((call.duration||0)/60),
-            source: 'gong',
-            crmMeta: accountMeta || null,
+            id:call.id,
+            date:(call.started||'').split('T')[0]||new Date().toISOString().split('T')[0],
+            duration:Math.round((call.duration||0)/60),
+            source:'gong',
+            crmMeta:accountMeta||null,
             ...analyzed,
           };
-          // Merge CRM tags
           if(accountMeta){
-            const crmTags = [accountMeta.acvBucket, accountMeta.empBucket, accountMeta.industry, accountMeta.leadSource, accountMeta.stageTag].filter(Boolean);
-            callObj.tags = [...new Set([...(callObj.tags||[]), ...crmTags])];
+            const crmTags = [accountMeta.acvBucket,accountMeta.empBucket,accountMeta.industry,accountMeta.leadSource,accountMeta.stageTag].filter(Boolean);
+            callObj.tags = [...new Set([...(callObj.tags||[]),...crmTags])];
           }
           newCalls.push(callObj);
           existingIds.add(call.id);
-          addSyncLog(`✓ Analyzed: ${callObj.company} (Score: ${callObj.scores?.overall||'—'})`);
+          addSyncLog('Analyzed: '+callObj.company+' (Score: '+(callObj.scores&&callObj.scores.overall?callObj.scores.overall:'?')+')');
           save('cs_calls', newCalls);
-          setState({ calls:[...newCalls], syncProgress:{current:i+1,total:matchedCalls.length,status:`Analyzing calls...`} });
-        } catch(e){ addSyncLog(`✗ Analysis failed for ${companyName}: ${e.message}`); }
+          setState({ calls:[...newCalls], syncProgress:{current:i+1,total:matchedCalls.length,status:'Analyzing...'} });
+        } catch(e){ addSyncLog('Failed: '+companyName+' - '+e.message); }
       }
     }
-
-    addSyncLog(`✅ Sync complete!`);
-    setState({ syncing:false, calls:newCalls, syncProgress:{current:matchedCalls.length,total:matchedCalls.length,status:"Complete!"} });
+    addSyncLog('Sync complete!');
+    setState({ syncing:false, calls:newCalls, syncProgress:{current:matchedCalls.length,total:matchedCalls.length,status:'Complete!'} });
     save('cs_calls', newCalls);
   } catch(e){
-    addSyncLog(`Error: ${e.message}`);
+    addSyncLog('Error: '+e.message);
     setState({ syncing:false });
   }
 }
