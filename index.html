@@ -349,19 +349,25 @@ async function syncGongCalls(){
       total += calls.length;
       page++;
       let hit = 0;
-
-
+      let pastCutoff = false;
 
       for(const c of calls){
+        // Gong returns newest first - stop when we pass our date window
+        if(c.started && new Date(c.started) < from){
+          pastCutoff = true;
+          break;
+        }
         if(existingIds.has(c.id)) continue;
         const acct = matchAccount(c);
         if(acct){ c._accountMeta = acct; matchedCalls.push(c); hit++; }
       }
-      addSyncLog('Page '+page+': '+calls.length+' calls, '+hit+' matched (total matched: '+matchedCalls.length+')');
-      setState({ syncProgress:{current:total,total:total,status:'Scanned '+total+' calls, '+matchedCalls.length+' matched...'} });
+      addSyncLog('Page '+page+': '+calls.length+' calls, '+hit+' matched (total: '+matchedCalls.length+')');
+      setState({ syncProgress:{current:total,total:total,status:'Scanned '+total+', matched '+matchedCalls.length+'...'} });
       cursor = data.records && data.records.cursor ? data.records.cursor : null;
-      if(calls.length === 0) break;
-
+      if(calls.length === 0 || pastCutoff){
+        if(pastCutoff) addSyncLog('Reached date cutoff, stopping.');
+        break;
+      }
       await new Promise(r=>setTimeout(r,150));
     } while(cursor);
 
