@@ -270,56 +270,92 @@ async function syncGongCalls(){
   if(!anthropicKey) { alert('Please add your Anthropic API key in Settings first.'); return; }
   if(!accountList.length) { alert('Please upload your account list CSV first so we know which calls to pull.'); return; }
 
-  const accountNames = new Set(accountList.map(a => a.accountName.toLowerCase().trim()));
-  setState({ syncing:true, syncProgress:{current:0,total:0,status:'Connecting to Gong...'}, syncLog:[] });
+  setState({ syncing:true, syncProgress:{current:0,total:accountList.length,status:'Starting account-by-account search...'}, syncLog:[] });
+
+  // Date range: last 90 days
+  const from = new Date(); from.setDate(from.getDate()-90);
+  const fromISO = from.toISOString();
+  const toISO = new Date().toISOString();
+
+  const newCalls = [...STATE.calls];
+  const existingIds = new Set(newCalls.map(c=>c.id));
+  const matchedCalls = [];
 
   try {
-    // Step 1: Get calls from last 30 days
-    const from = new Date(); from.setDate(from.getDate()-30);
-    setState({ syncProgress:{...STATE.syncProgress, status:'Fetching call list from Gong...'} });
+    // Step 1: Search Gong account by account — never pulls the full library
+    addSyncLog(`Searching Gong for ${accountList.length} accounts (last 90 days)...`);
 
-    let allCalls = [], cursor = null;
-    do {
-      const body = { filter:{ fromDateTime: from.toISOString(), toDateTime: new Date().toISOString() }, cursor };
-      const data = await gongRequest('/v2/calls/extensive', body, gongKey, gongSecret);
-      allCalls = allCalls.concat(data.calls || []);
-      cursor = data.records?.cursor || null;
-    } while(cursor);
+    for(let i=0; i<accountList.length; i++){
+      const account = accountList[i];
+      const name = account.accountName?.trim();
+      if(!name) continue;
 
-    addSyncLog(`Found ${allCalls.length} total calls in Gong`);
+      setState({ syncProgress:{current:i+1, total:accountList.length, status:`Searching: ${name}`} });
 
-    // Step 2: Filter to account list
-    const matched = allCalls.filter(c => {
-      const parties = c.parties || [];
-      const companyNames = parties.map(p=>(p.affiliation==='External'?p.name||p.emailAddress||'':'')).join(' ').toLowerCase();
-      const title = (c.title||'').toLowerCase();
-      for(const name of accountNames){
-        if(companyNames.includes(name)||title.includes(name)) return true;
+      try {
+        // Use Gong's search endpoint to find calls by company name
+        const data = await gongRequest('/v2/calls/extensive', {
+          filter:{
+            fromDateTime: fromISO,
+            toDateTime: toISO,
+            companyName: name,
+          }
+        }, gongKey, gongSecret);
+
+        const calls = data.calls || [];
+        if(calls.length){
+          addSyncLog(`Found ${calls.length} call${calls.length>1?'s':''} for ${name}`);
+          calls.forEach(c => { c._accountMeta = account; });
+          matchedCalls.push(...calls.filter(c=>!existingIds.has(c.id)));
+        }
+      } catch(e){
+        // If companyName filter isn't supported, fall back to title search
+        try {
+          const data = await gongRequest('/v2/calls/extensive', {
+            filter:{
+              fromDateTime: fromISO,
+              toDateTime: toISO,
+            },
+            contentSelector:{ context:'Extended', exposedFields:{ parties:true } }
+          }, gongKey, gongSecret);
+          const calls = (data.calls||[]).filter(c=>{
+            const title=(c.title||'').toLowerCase();
+            const parties=(c.parties||[]).map(p=>p.name||'').join(' ').toLowerCase();
+            const n=name.toLowerCase();
+            return title.includes(n)||parties.includes(n);
+          });
+          if(calls.length){
+            addSyncLog(`Found ${calls.length} call${calls.length>1?'s':''} for ${name} (title match)`);
+            calls.forEach(c=>{ c._accountMeta=account; });
+            matchedCalls.push(...calls.filter(c=>!existingIds.has(c.id)));
+          }
+        } catch(e2){ addSyncLog(`Skip ${name}: ${e2.message}`); }
       }
-      return false;
-    });
 
-    addSyncLog(`Matched ${matched.length} calls to your account list`);
-    setState({ syncProgress:{current:0,total:matched.length,status:`Analyzing ${matched.length} calls with AI...`} });
+      // Small delay to avoid rate limiting
+      await new Promise(r=>setTimeout(r,300));
+    }
 
-    if(!matched.length){
-      addSyncLog('No matching calls found. Check that account names in your CSV match company names in Gong.');
+    addSyncLog(`Total new matched calls: ${matchedCalls.length}`);
+
+    if(!matchedCalls.length){
+      addSyncLog('No new calls found. All may already be analyzed, or company names may not match Gong records.');
       setState({ syncing:false });
       return;
     }
 
-    // Step 3: Pull transcripts in batches of 20
-    const BATCH = 20;
-    const newCalls = [...STATE.calls];
-    const existingIds = new Set(newCalls.map(c=>c.id));
+    // Step 2: Pull transcripts in batches of 10
+    setState({ syncProgress:{current:0,total:matchedCalls.length,status:`Fetching transcripts for ${matchedCalls.length} calls...`} });
+    addSyncLog(`Fetching transcripts for ${matchedCalls.length} calls...`);
 
-    for(let i=0;i<matched.length;i+=BATCH){
-      const batch = matched.slice(i,i+BATCH);
+    const BATCH = 10;
+    for(let i=0;i<matchedCalls.length;i+=BATCH){
+      const batch = matchedCalls.slice(i,i+BATCH);
       const ids = batch.map(c=>c.id);
       let transcriptData;
       try {
         transcriptData = await gongRequest('/v2/calls/transcript', { filter:{ callIds:ids } }, gongKey, gongSecret);
-      } catch(e){ addSyncLog(`Transcript fetch error batch ${i}: ${e.message}`); continue; }
+      } catch(e){ addSyncLog(`Transcript fetch error: ${e.message}`); continue; }
 
       const txMap = {};
       (transcriptData.callTranscripts||[]).forEach(t => {
@@ -328,18 +364,16 @@ async function syncGongCalls(){
       });
 
       for(const call of batch){
-        if(existingIds.has(call.id)) { addSyncLog(`Skip (already analyzed): ${call.title||call.id}`); continue; }
         const transcript = txMap[call.id];
         if(!transcript||transcript.trim().length < 100){ addSyncLog(`Skip (no transcript): ${call.title||call.id}`); continue; }
 
-        // Find matching account metadata
+        const accountMeta = call._accountMeta;
         const ext = (call.parties||[]).find(p=>p.affiliation==='External');
-        const companyName = ext?.name || call.title || '';
-        const accountMeta = accountList.find(a => companyName.toLowerCase().includes(a.accountName.toLowerCase()) || a.accountName.toLowerCase().includes(companyName.toLowerCase()));
+        const companyName = accountMeta?.accountName || ext?.name || call.title || '';
         const repParty = (call.parties||[]).find(p=>p.affiliation==='Internal');
-        const repName = repParty?.name || '';
+        const repName = accountMeta?.rep || repParty?.name || '';
 
-        setState({ syncProgress:{current:i+1,total:matched.length,status:`Analyzing: ${companyName||call.id}`} });
+        setState({ syncProgress:{current:i+1,total:matchedCalls.length,status:`Analyzing: ${companyName}`} });
 
         try {
           const analyzed = await analyzeWithClaude(transcript, {
@@ -370,13 +404,13 @@ async function syncGongCalls(){
           existingIds.add(call.id);
           addSyncLog(`✓ Analyzed: ${callObj.company} (Score: ${callObj.scores?.overall||'—'})`);
           save('cs_calls', newCalls);
-          setState({ calls:[...newCalls], syncProgress:{current:i+1,total:matched.length,status:`Analyzed ${i+1} of ${matched.length}`} });
+          setState({ calls:[...newCalls], syncProgress:{current:i+1,total:matchedCalls.length,status:`Analyzing calls...`} });
         } catch(e){ addSyncLog(`✗ Analysis failed for ${companyName}: ${e.message}`); }
       }
     }
 
-    addSyncLog(`✅ Sync complete. ${newCalls.length - (STATE.calls.length)} new calls added.`);
-    setState({ syncing:false, calls:newCalls, syncProgress:{current:matched.length,total:matched.length,status:'Complete!'} });
+    addSyncLog(`✅ Sync complete!`);
+    setState({ syncing:false, calls:newCalls, syncProgress:{current:matchedCalls.length,total:matchedCalls.length,status:"Complete!"} });
     save('cs_calls', newCalls);
   } catch(e){
     addSyncLog(`Error: ${e.message}`);
