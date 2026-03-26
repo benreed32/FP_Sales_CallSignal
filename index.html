@@ -282,16 +282,21 @@ async function syncGongCalls(){
 
   function matchAccount(call){
     const title = (call.title||'').toLowerCase();
-    const parties = (call.parties||[]).map(p=>(p.name||p.emailAddress||'')).join(' ').toLowerCase();
+    const parties = (call.parties||[]).map(p=>[
+      p.name||'', 
+      p.emailAddress||'', 
+      p.organizationName||'',
+      p.company||''
+    ].join(' ')).join(' ').toLowerCase();
     const haystack = title + ' ' + parties;
     for(const name of accountNames){
-      if(haystack.includes(name)) return accountMap[name];
+      if(name.length >= 3 && haystack.includes(name)) return accountMap[name];
     }
     return null;
   }
 
   // 30 day window — fast, covers active pipeline
-  const from = new Date(); from.setDate(from.getDate()-30);
+  const from = new Date(); from.setDate(from.getDate()-60);
   const fromISO = from.toISOString();
   const toISO = new Date().toISOString();
 
@@ -304,13 +309,33 @@ async function syncGongCalls(){
     let cursor = null, page = 0, total = 0;
 
     do {
-      const body = { filter:{ fromDateTime:fromISO, toDateTime:toISO } };
+      const body = {
+        filter:{ fromDateTime:fromISO, toDateTime:toISO },
+        contentSelector:{
+          context: 'Extended',
+          exposedFields: { parties: true, content: { structure: true } }
+        }
+      };
       if(cursor) body.cursor = cursor;
       const data = await gongRequest('/v2/calls/extensive', body, gongKey, gongSecret);
       const calls = data.calls || [];
       total += calls.length;
       page++;
       let hit = 0;
+
+      // Debug: on page 1, show exactly what Gong returns so we can see field names
+      if(page === 1 && calls.length > 0){
+        const sample = calls[0];
+        const ext = (sample.parties||[]).find(p=>p.affiliation==='External');
+        const intP = (sample.parties||[]).find(p=>p.affiliation==='Internal');
+        addSyncLog('DEBUG - Sample call title: ' + (sample.title||'(none)'));
+        addSyncLog('DEBUG - External party name: ' + (ext ? (ext.name||ext.emailAddress||'(no name)') : '(none)'));
+        addSyncLog('DEBUG - External org/company: ' + (ext ? (ext.organizationName||ext.company||'(no org field)') : '(none)'));
+        addSyncLog('DEBUG - Internal rep name: ' + (intP ? (intP.name||'(none)') : '(none)'));
+        addSyncLog('DEBUG - All party names: ' + (sample.parties||[]).map(p=>p.name||p.emailAddress||'?').join(', '));
+        addSyncLog('DEBUG - Your CSV names (first 3): ' + accountNames.slice(0,3).join(', '));
+      }
+
       for(const c of calls){
         if(existingIds.has(c.id)) continue;
         const acct = matchAccount(c);
@@ -320,6 +345,8 @@ async function syncGongCalls(){
       setState({ syncProgress:{current:total,total:total,status:'Scanned '+total+' calls, '+matchedCalls.length+' matched...'} });
       cursor = data.records && data.records.cursor ? data.records.cursor : null;
       if(calls.length === 0) break;
+      // Only scan first 3 pages in debug mode to see results fast
+      if(page >= 3) { addSyncLog('DEBUG: Stopping after 3 pages. Check field names above then we will fix matching.'); break; }
       await new Promise(r=>setTimeout(r,150));
     } while(cursor);
 
