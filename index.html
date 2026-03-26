@@ -344,8 +344,7 @@ async function syncGongCalls(){
 
       const txMap = {};
       (txData.callTranscripts||[]).forEach(t=>{
-        txMap[t.callId] = (t.transcript||[]).map(u=>(u.sentences||[]).map(s=>s.text).join(' ')).join('
-');
+        txMap[t.callId] = (t.transcript||[]).map(u=>(u.sentences||[]).map(s=>s.text).join(' ')).join(' ');
       });
 
       for(const call of batch){
