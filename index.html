@@ -274,8 +274,8 @@ async function syncGongCalls(){
   setState({ syncing:true, syncProgress:{current:0,total:0,status:'Connecting to Gong...'}, syncLog:[] });
 
   try {
-    // Step 1: Get calls from last 180 days
-    const from = new Date(); from.setDate(from.getDate()-180);
+    // Step 1: Get calls from last 30 days
+    const from = new Date(); from.setDate(from.getDate()-30);
     setState({ syncProgress:{...STATE.syncProgress, status:'Fetching call list from Gong...'} });
 
     let allCalls = [], cursor = null;
